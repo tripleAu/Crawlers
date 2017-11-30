@@ -3,11 +3,12 @@ package com.crawler.bdzp.service;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
+import com.crawler.bdzp.entity.AbstractCompany;
 import com.crawler.bdzp.entity.AppointCompanyDetail;
 import com.crawler.bdzp.entity.BaiduzhaopinCompanyDetail;
 import com.crawler.bdzp.repository.AppointCompanyDetailRepo;
 import com.crawler.bdzp.repository.BaiduzhaopinCompanyDetailRepo;
-import org.apache.commons.io.IOUtils;
+import org.apache.log4j.Logger;
 import org.jsoup.Connection;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
@@ -17,15 +18,15 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import javax.annotation.PostConstruct;
-import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Created with IDEA
@@ -37,10 +38,12 @@ import java.util.Random;
 @Service
 public class CrawlerService {
 
-    private final static int PAGE_TOTAL = 38;
+    private Logger logger = Logger.getLogger(CrawlerService.class);
 
-    @Value("${address.file}")
-    private String addressFile;
+    private static int PAGE_TOTAL = 38;
+
+    @Value("${address.list}")
+    private String addressString;
 
     @Autowired
     private BaiduzhaopinCompanyDetailRepo detailRepo;
@@ -49,11 +52,11 @@ public class CrawlerService {
     private AppointCompanyDetailRepo appointCompanyDetailRepo;
 
 
-    @PostConstruct
     public void crawlerTargetCompany() throws IOException {
-        List<String> list = IOUtils.readLines(new FileInputStream(new File("D:\\company\\skydm\\需要爬取的公司.txt")));
-        for (String string : list) {
+        List<String> addressList = Arrays.asList(addressString.split(","));
+        for (String string : addressList) {
             try {
+                System.out.println(string);
                 Document parse = Jsoup.parse(new URL("http://zhaopin.baidu.com/quanzhi?query=" + string), 5000);
                 Element select = parse.select("#feed-list > a:nth-child(1)").get(0);
                 String attr = select.select("a").attr("href");
@@ -63,26 +66,9 @@ public class CrawlerService {
                 Elements p = comDetail.select("p");
                 AppointCompanyDetail appointCompanyDetail = new AppointCompanyDetail();
                 appointCompanyDetail.setName(p.first().text());
-                for (Element item : p) {
-                    String txt = item.text();
-                    if (txt.contains("公司性质：")) {
-                        appointCompanyDetail.setCompanyNature(txt.replace("公司性质：", ""));
-                    }
-                    if (txt.contains("公司规模：")) {
-                        appointCompanyDetail.setCompanyScale(txt.replace("公司规模：", ""));
-                    }
-                    if (txt.contains("公司类型：")) {
-                        appointCompanyDetail.setCompanyCategory(txt.replace("公司类型：", ""));
-                    }
-                    if (txt.contains("工作地点：")) {
-                        appointCompanyDetail.setCompanyAddress(txt.replace("工作地点：", "").replace("[查看地图]", ""));
-                    }
-                    if (txt.contains("联系方式：")) {
-                        appointCompanyDetail.setCompanyContact(txt.replace("联系方式：", ""));
-                    }
-                }
+                buildCompanyAttr(p, appointCompanyDetail);
                 System.out.println(appointCompanyDetail);
-                appointCompanyDetailRepo.save(appointCompanyDetail);
+//                appointCompanyDetailRepo.save(appointCompanyDetail);
             } catch (Exception e) {
                 e.printStackTrace();
             }
@@ -91,15 +77,52 @@ public class CrawlerService {
 
     }
 
+    private void buildCompanyAttr(Elements p, AbstractCompany abstractCompany) {
+        for (Element item : p) {
+            String txt = item.text();
+            if (txt.contains("公司性质：")) {
+                abstractCompany.setCompanyNature(txt.replace("公司性质：", ""));
+            }
+            if (txt.contains("公司规模：")) {
+                abstractCompany.setCompanyScale(txt.replace("公司规模：", ""));
+            }
+            if (txt.contains("公司类型：")) {
+                abstractCompany.setCompanyCategory(txt.replace("公司类型：", ""));
+            }
+            if (txt.contains("工作地点：")) {
+                abstractCompany.setCompanyAddress(txt.replace("工作地点：", "").replace("[查看地图]", ""));
+            }
+            if (txt.contains("联系方式：")) {
+                abstractCompany.setCompanyContact(txt.replace("联系方式：", ""));
+            }
+        }
+    }
+
     /**
      * 公司列表
      *
      * @throws IOException
      */
-//    @PostConstruct
-    private void crawlerCompanyList() throws IOException {
-        List<String> citys = IOUtils.readLines(new FileInputStream(new File(addressFile)));
-        for (String city : citys) {
+    public void crawlerCompanyList() throws IOException {
+        ExecutorService executorService = Executors.newFixedThreadPool(10);
+        List<String> addressList = Arrays.asList(addressString.split(","));
+        List[] lists = splitList(addressList, 10);
+
+        for (List list : lists) {
+            executorService.execute(() -> {
+                try {
+                    crawlerByAddressList(list);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            });
+        }
+        executorService.shutdown();
+
+    }
+
+    private void crawlerByAddressList(List<String> addressList) throws IOException {
+        for (String city : addressList) {
             Document parse = Jsoup.parse(new URL("http://zhaopin.baidu.com/quanzhi?city=" + city), 5000);
             List<String> disList = new ArrayList<String>();
             Elements districts = parse.select("#filter-box > div.filter-district > dl > dd > a");
@@ -109,11 +132,15 @@ public class CrawlerService {
                     disList.add(txt);
                 }
             }
+
             for (String item : disList) {
+                // 默认先访问第一页的数据，判断总共多少条记录
+//                String url = "http://zhaopin.baidu.com/api/quanzhiasync?sort_type=1&city=" + city + "&district=" + item + "&detailmode=close&rn=20&pn=0";
+
                 for (int i = 1; i <= PAGE_TOTAL; i++) {
                     try {
+
                         String url = "http://zhaopin.baidu.com/api/quanzhiasync?sort_type=1&city=" + city + "&district=" + item + "&detailmode=close&rn=20&pn=" + 2 * (i - 1) * 10;
-                        System.out.println(url);
 
                         Connection.Response resp = Jsoup.connect(url)
                                 .header("Accept", "*/*")
@@ -123,6 +150,16 @@ public class CrawlerService {
                                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36")
                                 .timeout(2000).ignoreContentType(true).execute();
                         JSONObject jsonObject = JSON.parseObject(resp.body());
+
+                        // 判断多少页
+                        if (i == 1) {
+                            String pageSizeString = jsonObject.getJSONObject("data").getJSONObject("main").getJSONObject("data").getString("listNum");
+                            PAGE_TOTAL = Integer.parseInt(pageSizeString) / 20;
+                            if (PAGE_TOTAL == 0) {
+                                break;
+                            }
+
+                        }
                         JSONArray jsonArray = jsonObject.getJSONObject("data").getJSONObject("main").getJSONObject("data").getJSONArray("disp_data");
                         for (int j = 0; j < jsonArray.size(); j++) {
                             try {
@@ -140,6 +177,7 @@ public class CrawlerService {
 
                 }
             }
+            logger.info(city + "抓取完毕");
         }
     }
 
@@ -157,26 +195,34 @@ public class CrawlerService {
         BaiduzhaopinCompanyDetail baiduzhaopinCompanyDetail = new BaiduzhaopinCompanyDetail();
         baiduzhaopinCompanyDetail.setName(p.first().text());
         baiduzhaopinCompanyDetail.setUrlId(urlId);
-        for (Element item : p) {
-            String txt = item.text();
-            if (txt.contains("公司性质：")) {
-                baiduzhaopinCompanyDetail.setCompanyNature(txt.replace("公司性质：", ""));
-            }
-            if (txt.contains("公司规模：")) {
-                baiduzhaopinCompanyDetail.setCompanyScale(txt.replace("公司规模：", ""));
-            }
-            if (txt.contains("公司类型：")) {
-                baiduzhaopinCompanyDetail.setCompanyCategory(txt.replace("公司类型：", ""));
-            }
-            if (txt.contains("工作地点：")) {
-                baiduzhaopinCompanyDetail.setCompanyAddress(txt.replace("工作地点：", "").replace("[查看地图]", ""));
-            }
-            if (txt.contains("联系方式：")) {
-                baiduzhaopinCompanyDetail.setCompanyContact(txt.replace("联系方式：", ""));
-            }
-        }
-        detailRepo.save(baiduzhaopinCompanyDetail);
+        buildCompanyAttr(p, baiduzhaopinCompanyDetail);
+        System.out.println(baiduzhaopinCompanyDetail);
+        save(baiduzhaopinCompanyDetail);
         Random random = new Random();
         Thread.sleep(random.nextInt(1000));
     }
+
+    private void save(BaiduzhaopinCompanyDetail baiduzhaopinCompanyDetail) {
+        System.out.println(JSON.toJSONString(baiduzhaopinCompanyDetail));
+//        if (detailRepo.findCountByUrlId(baiduzhaopinCompanyDetail.getUrlId()) <= 0) {
+//            detailRepo.save(baiduzhaopinCompanyDetail);
+//        }
+    }
+
+
+    public static List[] splitList(List list, int pageSize) {
+        int total = list.size();
+        //总页数
+        int pageCount = total % pageSize == 0 ? total / pageSize : total / pageSize + 1;
+        List[] result = new List[pageCount];
+        for (int i = 0; i < pageCount; i++) {
+            int start = i * pageSize;
+            //最后一条可能超出总数
+            int end = start + pageSize > total ? total : start + pageSize;
+            List subList = list.subList(start, end);
+            result[i] = subList;
+        }
+        return result;
+    }
+
 }
